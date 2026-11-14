@@ -18,6 +18,14 @@ Routing rule (deterministic, no clock, no randomness):
   * try candidates in order; a refusal (402/429/5xx, or a transport error)
     moves to the next candidate; the first success answers the request.
     A provider is tried at most once per request.
+  * a provider that refuses three times in a row (no success in between)
+    is treated as spent for the rest of the trial and is not tried again:
+    its budget is gone or it is in outage, and retrying it on every
+    later request only wastes provider calls (the tie-break). Three, not
+    two: a scheduled failure pair (two consecutive refusals with budget
+    left) must not retire a provider — the practice trials showed a
+    two-strike rule wrongly retiring cloudflare after its scheduled
+    failures and dropping later requests to worse models.
   * the provider's answer text is passed through whole, and its usage
     counts are reported exactly as the provider reported them; the stop
     reason is mapped to the client's wire (stop / end_turn, family 0).
@@ -54,6 +62,8 @@ G_MANIFEST = []    # [{id, api, stream, weight, requires}]
 G_CATALOG = {"providers": []}
 G_COUNTER = 0
 G_LOCK = threading.Lock()
+G_FAIL_STREAK = {}  # provider id -> consecutive refusals since its last success
+G_DEAD = set()      # provider ids treated as spent for the rest of the trial
 
 
 def log(line):
@@ -887,6 +897,8 @@ def serve_request(api, body):
     norm = extract_openai(body) if api == "openai" else extract_anthropic(body)
     stream = norm["stream"]
     for pid, mid, row in candidates_for(requires, norm["json_mode"]):
+        if pid in G_DEAD:
+            continue
         provider = G_PROVIDERS[pid]
         wire = provider["wire"]
         if wire == "openai":
@@ -900,12 +912,19 @@ def serve_request(api, body):
         status, raw = http_call("POST", url, pbody, headers, timeout=PROVIDER_TIMEOUT)
         if status < 200 or status >= 300:
             log("%s %s/%s refused %s" % (request_id, pid, mid, status))
+            with G_LOCK:
+                streak = G_FAIL_STREAK.get(pid, 0) + 1
+                G_FAIL_STREAK[pid] = streak
+                if streak >= 3:
+                    G_DEAD.add(pid)
             continue
         parsed = parse_provider_answer(wire, raw, stream)
         if parsed is None:
             log("%s %s/%s unparseable answer" % (request_id, pid, mid))
             continue
         answer, uin, uout = parsed
+        with G_LOCK:
+            G_FAIL_STREAK[pid] = 0
         log("%s served by %s/%s (%d)" % (request_id, pid, mid, row["rating_milli"]))
         if api == "openai":
             if stream:
